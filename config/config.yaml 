@@ -1,0 +1,145 @@
+# Конфигурация торгового бота для Bybit
+
+# Настройки API
+api:
+  testnet: true  # Использовать тестовую сеть (для тестирования)
+  api_key: "YOUR_API_KEY_HERE"
+  api_secret: "YOUR_API_SECRET_HERE"
+
+# Общие настройки бота
+bot:
+  strategy_interval: 60  # Интервал проверки стратегий (секунды)
+  log_level: "INFO"      # Уровень логирования (DEBUG, INFO, WARNING, ERROR)
+
+# Настройки торговли
+trading:
+  symbols:
+    - "BTCUSDT"  # Биткоин
+    - "ETHUSDT"  # Эфириум
+    - "SOLUSDT"  # Solana
+    - "AVAXUSDT" # Avalanche
+    - "ARBUSDT"  # Arbitrum
+    - "BNBUSDT"  # Binance Coin
+  intervals:
+    - "1m"       # 1 минута
+    - "5m"       # 5 минут
+    - "15m"      # 15 минут
+    - "1h"       # 1 час
+    - "4h"       # 4 часа
+    - "1d"       # 1 день
+
+# Настройки для режима бумажной торговли
+paper_trading:
+  initial_balance: 10000  # Начальный баланс в USDT
+
+# Настройки управления рисками
+risk_management:
+  max_positions: 5                # Максимальное количество одновременно открытых позиций
+  max_positions_per_symbol: 1     # Максимальное количество позиций на один символ
+  max_risk_per_trade: 1.0         # Максимальный риск на одну сделку (% от баланса)
+  max_risk_total: 5.0             # Максимальный общий риск (% от баланса)
+  min_risk_reward_ratio: 2.0      # Минимальное соотношение риск/прибыль
+  leverage: 3                     # Кредитное плечо
+  stop_loss_percent: 1.0          # Размер стоп-лосса (% от цены входа)
+  trailing_stop_enabled: true     # Использовать трейлинг-стоп
+  trailing_stop_activation: 1.0   # Активация трейлинг-стопа (% прибыли)
+  trailing_stop_callback: 0.5     # Отступ трейлинг-стопа (% от цены)
+
+# Настройки анализа тренда BTC
+btc_analysis:
+  symbol: "BTCUSDT"         # Торговая пара для анализа
+  timeframe: "1h"           # Таймфрейм для анализа
+  ma_fast_period: 20        # Период быстрой MA
+  ma_slow_period: 50        # Период медленной MA
+  macd_fast: 12             # Период быстрой линии MACD
+  macd_slow: 26             # Период медленной линии MACD
+  macd_signal: 9            # Период сигнальной линии MACD
+  rsi_period: 14            # Период RSI
+
+# Настройки анализа рынка
+market_analysis:
+  indicators:
+    ma:
+      - period: 20
+        type: "simple"
+        source: "close"
+      - period: 50
+        type: "simple"
+        source: "close"
+      - period: 200
+        type: "simple"
+        source: "close"
+      - period: 9
+        type: "exponential"
+        source: "close"
+    macd:
+      fast_period: 12
+      slow_period: 26
+      signal_period: 9
+      source: "close"
+    rsi:
+      period: 14
+      source: "close"
+    stochastic:
+      k_period: 14
+      d_period: 3
+      slowing: 3
+    bollinger_bands:
+      period: 20
+      std_dev: 2
+      source: "close"
+    atr:
+      period: 14
+    support_resistance:
+      window: 10
+    patterns:
+      patterns:
+        - "doji"
+        - "hammer"
+        - "engulfing"
+        - "harami"
+
+# Настройки стратегий
+strategies:
+  strategies:
+    # Стратегия MACD
+    - name: "MACD Strategy"
+      class: "MacdStrategy"
+      enabled: true
+      symbols:
+        - "BTCUSDT"
+        - "ETHUSDT"
+        - "SOLUSDT"
+      timeframes:
+        - "15m"
+        - "1h"
+      params:
+        macd_fast: 12
+        macd_slow: 26
+        macd_signal: 9
+        rsi_period: 14
+        rsi_overbought: 70
+        rsi_oversold: 30
+        max_positions: 3
+        position_size_pct: 2.0
+    
+    # Стратегия поддержки и сопротивления
+    - name: "Support Resistance Strategy"
+      class: "SupportResistanceStrategy"
+      enabled: true
+      symbols:
+        - "BTCUSDT"
+        - "ETHUSDT"
+        - "BNBUSDT"
+      timeframes:
+        - "1h"
+        - "4h"
+      params:
+        window: 20
+        lookback_periods: 100
+        rsi_period: 14
+        rsi_overbought: 70
+        rsi_oversold: 30
+        atr_period: 14
+        atr_multiplier: 2.0
+        max_positions: 2
