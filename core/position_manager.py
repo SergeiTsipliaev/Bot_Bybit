@@ -1,570 +1,1149 @@
+# -*- coding: utf-8 -*-
+
+"""
+Класс для управления позициями
+"""
+
 import time
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
 from decimal import Decimal
 
-# Предполагаем, что у нас есть клиент Bybit в другом модуле
-from .bybit_client import BybitClient
-from .risk_manager import RiskManager
-from .order_manager import OrderManager
-from .position_calculator import calculate_position_size, calculate_stop_loss, calculate_take_profit
-
-# Настройка логгера
-logger = logging.getLogger(__name__)
-
 class PositionManager:
-    """
-    Класс для управления позициями на бирже Bybit.
-    Отвечает за:
-    - Открытие новых позиций
-    - Закрытие существующих позиций
-    - Модификацию параметров открытых позиций
-    - Контроль риска и прибыли
-    - Мониторинг статуса позиций
-    """
+    """Класс для управления торговыми позициями"""
     
-    def __init__(self, client: BybitClient, risk_manager: RiskManager, order_manager: OrderManager):
+    def __init__(self, api_client, config, risk_manager, paper_trading=False, logger=None):
         """
         Инициализация менеджера позиций
         
         Args:
-            client: Экземпляр клиента Bybit API
-            risk_manager: Экземпляр менеджера риска
-            order_manager: Экземпляр менеджера ордеров
+            api_client: HTTP-клиент API Bybit
+            config (dict): конфигурация бота
+            risk_manager: объект управления рисками
+            paper_trading (bool): режим бумажной торговли
+            logger: объект логгера
         """
-        self.client = client
+        self.api_client = api_client
+        self.config = config
         self.risk_manager = risk_manager
-        self.order_manager = order_manager
+        self.paper_trading = paper_trading
+        self.logger = logger or logging.getLogger(__name__)
         
-        # Кэш открытых позиций
-        self._positions_cache = {}
-        self._last_update_time = 0
+        # Кэш позиций
+        self.positions = {}
+        self.last_update_time = 0
         
-        # Интервал обновления кэша позиций (в секундах)
+        # Журнал операций
+        self.operations_log = []
+        
+        # Время обновления кэша (в секундах)
         self.cache_update_interval = 5
+        
+        # В режиме бумажной торговли храним позиции в памяти
+        if self.paper_trading:
+            self.paper_positions = {}
+            self.paper_orders = {}
+            self.paper_balance = config['paper_trading']['initial_balance']
     
-    def refresh_positions(self, force: bool = False) -> Dict:
+    def get_active_positions(self):
         """
-        Обновляет кэш открытых позиций
+        Получение всех активных позиций
+        
+        Returns:
+            dict: активные позиции
+        """
+        self._update_positions()
+        return self.positions
+    
+    def _update_positions(self, force=False):
+        """
+        Обновление информации о позициях
         
         Args:
-            force: Принудительно обновить кэш, игнорируя интервал обновления
-            
-        Returns:
-            Dict: Словарь с текущими открытыми позициями
+            force (bool): принудительное обновление
         """
         current_time = time.time()
         
         # Проверяем, нужно ли обновлять кэш
-        if force or (current_time - self._last_update_time) >= self.cache_update_interval:
+        if force or (current_time - self.last_update_time >= self.cache_update_interval):
             try:
-                # Получаем все открытые позиции
-                positions = self.client.get_positions()
-                
-                # Обновляем кэш
-                self._positions_cache = {
-                    f"{p['symbol']}_{p['side'].lower()}": p 
-                    for p in positions if float(p['size']) > 0
-                }
-                
-                self._last_update_time = current_time
-                logger.debug(f"Positions cache refreshed. Found {len(self._positions_cache)} active positions.")
-            except Exception as e:
-                logger.error(f"Failed to refresh positions: {str(e)}")
-        
-        return self._positions_cache
-    
-    def get_position(self, symbol: str, side: str = None) -> Optional[Dict]:
-        """
-        Получает информацию о конкретной позиции
-        
-        Args:
-            symbol: Символ торговой пары (например, 'BTCUSDT')
-            side: Сторона позиции ('buy' или 'sell'). Если не указана, 
-                  возвращает все позиции по данному символу
-        
-        Returns:
-            Dict or List[Dict]: Информация о позиции или список позиций
-        """
-        # Обновляем кэш позиций
-        positions = self.refresh_positions()
-        
-        if side:
-            # Нормализуем сторону к нижнему регистру
-            side = side.lower()
-            position_key = f"{symbol}_{side}"
-            return positions.get(position_key)
-        else:
-            # Возвращаем все позиции по символу
-            return [p for k, p in positions.items() if k.startswith(f"{symbol}_")]
-    
-    def open_position(
-        self, 
-        symbol: str, 
-        side: str, 
-        size: Union[float, Decimal] = None, 
-        entry_price: Union[float, Decimal] = None,
-        stop_loss: Union[float, Decimal] = None,
-        take_profit: Union[float, Decimal] = None,
-        leverage: int = None,
-        position_mode: str = "one-way",
-        order_type: str = "market",
-        time_in_force: str = "GoodTillCancel",
-        reduce_only: bool = False,
-        close_on_trigger: bool = False,
-        risk_percentage: float = None,
-        **kwargs
-    ) -> Dict:
-        """
-        Открывает новую позицию
-        
-        Args:
-            symbol: Символ торговой пары
-            side: Сторона ('buy' или 'sell')
-            size: Размер позиции (в контрактах или долларах, в зависимости от настроек)
-            entry_price: Цена входа (для лимитных ордеров)
-            stop_loss: Уровень стоп-лосса
-            take_profit: Уровень тейк-профита
-            leverage: Кредитное плечо
-            position_mode: Режим позиции ('one-way' или 'hedge')
-            order_type: Тип ордера ('market', 'limit', 'stop', 'stop_market', 'take_profit', 'take_profit_market')
-            time_in_force: Время действия ордера ('GoodTillCancel', 'ImmediateOrCancel', 'FillOrKill', 'PostOnly')
-            reduce_only: Флаг reduce-only
-            close_on_trigger: Флаг close-on-trigger
-            risk_percentage: Процент риска от баланса (если указан, то size будет рассчитан автоматически)
-            
-        Returns:
-            Dict: Результат размещения ордера
-        """
-        # Нормализуем сторону
-        side = side.lower()
-        
-        # Проверяем, установлен ли режим позиции
-        current_mode = self.client.get_position_mode(symbol)
-        if current_mode != position_mode:
-            logger.info(f"Changing position mode for {symbol} from {current_mode} to {position_mode}")
-            self.client.set_position_mode(symbol, position_mode)
-        
-        # Если указан leverage, устанавливаем его
-        if leverage is not None:
-            current_leverage = self.client.get_leverage(symbol)
-            if current_leverage != leverage:
-                logger.info(f"Changing leverage for {symbol} from {current_leverage}x to {leverage}x")
-                self.client.set_leverage(symbol, leverage)
-        
-        # Получаем текущую цену, если необходимо
-        current_price = None
-        if entry_price is None or risk_percentage is not None:
-            ticker = self.client.get_ticker(symbol)
-            current_price = float(ticker["last_price"])
-            
-            if entry_price is None and order_type != "market":
-                entry_price = current_price
-        
-        # Рассчитываем размер позиции на основе риска, если указан
-        if risk_percentage is not None:
-            if stop_loss is None:
-                raise ValueError("Stop loss must be provided when using risk-based position sizing")
-            
-            # Получаем баланс аккаунта
-            account_info = self.client.get_wallet_balance()
-            balance = float(account_info["balance"])
-            
-            # Рассчитываем размер позиции
-            price = entry_price if entry_price is not None else current_price
-            size = calculate_position_size(
-                balance=balance,
-                risk_percentage=risk_percentage,
-                entry_price=price,
-                stop_loss=float(stop_loss),
-                leverage=leverage or 1
-            )
-            
-            logger.info(f"Calculated position size based on {risk_percentage}% risk: {size}")
-        
-        # Проверяем через риск-менеджер
-        if not self.risk_manager.is_position_allowed(
-            symbol=symbol, 
-            side=side, 
-            size=size, 
-            leverage=leverage,
-            current_positions=self.refresh_positions(force=True)
-        ):
-            error_msg = f"Position not allowed by risk manager: {symbol} {side} {size}"
-            logger.warning(error_msg)
-            raise ValueError(error_msg)
-        
-        # Размещаем основной ордер для входа в позицию
-        order_result = self.order_manager.place_order(
-            symbol=symbol,
-            side=side,
-            qty=size,
-            price=entry_price,
-            order_type=order_type,
-            time_in_force=time_in_force,
-            reduce_only=reduce_only,
-            close_on_trigger=close_on_trigger,
-            **kwargs
-        )
-        
-        # Если ордер успешно размещен, устанавливаем стоп-лосс и тейк-профит
-        if order_result.get("order_id") and (stop_loss is not None or take_profit is not None):
-            try:
-                # Устанавливаем стоп-лосс
-                if stop_loss is not None:
-                    sl_side = "sell" if side == "buy" else "buy"
-                    self.order_manager.place_order(
-                        symbol=symbol,
-                        side=sl_side,
-                        qty=size,
-                        price=stop_loss,
-                        order_type="stop",
-                        time_in_force="GoodTillCancel",
-                        reduce_only=True,
-                        close_on_trigger=True,
-                        trigger_price=stop_loss,
-                        **kwargs
+                if not self.paper_trading:
+                    # Получаем реальные позиции через API
+                    positions_response = self.api_client.get_positions(
+                        category="linear",
+                        settleCoin="USDT"
                     )
+                    
+                    if positions_response['retCode'] == 0:
+                        positions_list = positions_response['result']['list']
+                        self.positions = {}
+                        
+                        for pos in positions_list:
+                            # Фильтруем только позиции с ненулевым размером
+                            if float(pos['size']) > 0:
+                                symbol = pos['symbol']
+                                side = 'long' if pos['side'] == 'Buy' else 'short'
+                                position_key = f"{symbol}_{side}"
+                                
+                                self.positions[position_key] = {
+                                    'symbol': symbol,
+                                    'side': side,
+                                    'size': float(pos['size']),
+                                    'entry_price': float(pos['entryPrice']),
+                                    'leverage': float(pos['leverage']),
+                                    'margin_type': pos['marginType'],
+                                    'unrealized_pnl': float(pos['unrealisedPnl']),
+                                    'realized_pnl': float(pos['realisedPnl']),
+                                    'position_value': float(pos['positionValue']),
+                                    'created_time': datetime.fromtimestamp(int(pos['createdTime']) / 1000),
+                                    'updated_time': datetime.fromtimestamp(int(pos['updatedTime']) / 1000)
+                                }
+                    else:
+                        self.logger.error(f"Ошибка при получении позиций: {positions_response['retMsg']}")
                 
-                # Устанавливаем тейк-профит
-                if take_profit is not None:
-                    tp_side = "sell" if side == "buy" else "buy"
-                    self.order_manager.place_order(
-                        symbol=symbol,
-                        side=tp_side,
-                        qty=size,
-                        price=take_profit,
-                        order_type="take_profit",
-                        time_in_force="GoodTillCancel",
-                        reduce_only=True,
-                        close_on_trigger=True,
-                        trigger_price=take_profit,
-                        **kwargs
-                    )
+                else:
+                    # В режиме бумажной торговли используем локальные данные
+                    self.positions = self.paper_positions
+                
+                self.last_update_time = current_time
+                
             except Exception as e:
-                logger.error(f"Failed to set SL/TP for {symbol} {side} position: {str(e)}")
-        
-        # Заставляем обновить кэш после открытия позиции
-        self.refresh_positions(force=True)
-        
-        return order_result
+                self.logger.error(f"Ошибка при обновлении информации о позициях: {str(e)}")
     
-    def close_position(
-        self, 
-        symbol: str, 
-        side: str = None, 
-        percentage: float = 100.0,
-        order_type: str = "market",
-        **kwargs
-    ) -> Dict:
+    def open_position(self, symbol, side, size=None, entry_price=None, stop_loss=None, take_profit=None, 
+                      order_type='Market', strategy_name=None):
         """
-        Закрывает позицию полностью или частично
+        Открытие новой позиции
         
         Args:
-            symbol: Символ торговой пары
-            side: Сторона позиции ('buy' или 'sell'). Если не указана и есть 
-                  только одна позиция по символу, закрывается она
-            percentage: Процент позиции для закрытия (по умолчанию 100%)
-            order_type: Тип ордера для закрытия ('market', 'limit')
-            **kwargs: Дополнительные параметры для ордера
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            size (float, optional): размер позиции
+            entry_price (float, optional): цена входа (для лимитных ордеров)
+            stop_loss (float, optional): уровень стоп-лосса
+            take_profit (float, optional): уровень тейк-профита
+            order_type (str): тип ордера ('Market', 'Limit')
+            strategy_name (str, optional): название стратегии
             
         Returns:
-            Dict: Результат размещения ордера на закрытие
+            dict: результат открытия позиции
         """
-        # Получаем информацию о позиции
-        position = None
-        
-        if side:
-            # Если указана сторона, получаем конкретную позицию
-            position = self.get_position(symbol, side)
-        else:
-            # Иначе получаем все позиции по символу
-            positions = self.get_position(symbol)
-            if len(positions) == 1:
-                position = positions[0]
-            elif len(positions) > 1:
-                raise ValueError(f"Multiple positions found for {symbol}. Please specify side ('buy' or 'sell').")
-        
-        if not position or float(position['size']) == 0:
-            logger.warning(f"No active position found for {symbol} {side if side else ''}")
-            return {"success": False, "message": "No active position found"}
-        
-        # Определяем сторону для ордера закрытия (противоположную открытой позиции)
-        close_side = "sell" if position['side'].lower() == "buy" else "buy"
-        
-        # Рассчитываем размер для закрытия
-        position_size = float(position['size'])
-        close_size = position_size * percentage / 100.0
-        
-        # Размещаем ордер на закрытие
-        order_result = self.order_manager.place_order(
-            symbol=symbol,
-            side=close_side,
-            qty=close_size,
-            order_type=order_type,
-            reduce_only=True,
-            **kwargs
-        )
-        
-        # Заставляем обновить кэш после закрытия
-        self.refresh_positions(force=True)
-        
-        return order_result
-    
-    def modify_position(
-        self, 
-        symbol: str, 
-        side: str,
-        stop_loss: Union[float, Decimal] = None,
-        take_profit: Union[float, Decimal] = None,
-        trailing_stop: Union[float, Decimal] = None,
-        **kwargs
-    ) -> Dict:
-        """
-        Изменяет параметры существующей позиции
-        
-        Args:
-            symbol: Символ торговой пары
-            side: Сторона позиции ('buy' или 'sell')
-            stop_loss: Новый уровень стоп-лосса
-            take_profit: Новый уровень тейк-профита
-            trailing_stop: Новое значение trailing stop
-            
-        Returns:
-            Dict: Результат изменения параметров
-        """
-        # Получаем информацию о позиции
-        position = self.get_position(symbol, side)
-        
-        if not position or float(position['size']) == 0:
-            logger.warning(f"No active position found for {symbol} {side}")
-            return {"success": False, "message": "No active position found"}
-        
-        result = {}
-        
-        # Отменяем существующие стоп-лосс и тейк-профит ордера
         try:
-            # Получаем активные ордера
-            active_orders = self.client.get_active_orders(symbol)
+            # Нормализация стороны для API Bybit
+            api_side = "Buy" if side.lower() == "long" else "Sell"
             
-            # Фильтруем ордера SL/TP, связанные с позицией
-            sl_tp_orders = [
-                order for order in active_orders
-                if (order["order_type"] in ["stop", "stop_market", "take_profit", "take_profit_market"])
-                and order["reduce_only"] == True
-            ]
+            # Получение текущей цены, если не указана
+            if entry_price is None:
+                ticker = self._get_ticker(symbol)
+                if ticker:
+                    entry_price = float(ticker['last_price'])
+                else:
+                    self.logger.error(f"Не удалось получить цену для {symbol}")
+                    return None
             
-            # Отменяем найденные ордера
-            for order in sl_tp_orders:
-                self.order_manager.cancel_order(symbol, order["order_id"])
-                logger.debug(f"Cancelled {order['order_type']} order {order['order_id']} for {symbol}")
-        except Exception as e:
-            logger.error(f"Failed to cancel existing SL/TP orders: {str(e)}")
-        
-        # Устанавливаем новые значения
-        try:
-            position_size = float(position['size'])
-            opposite_side = "sell" if side.lower() == "buy" else "buy"
+            # Установка плеча, если необходимо
+            leverage = self.config['risk_management']['leverage']
+            self._set_leverage(symbol, leverage)
             
-            # Устанавливаем новый стоп-лосс
-            if stop_loss is not None:
-                sl_result = self.order_manager.place_order(
+            # Расчет размера позиции, если не указан
+            if size is None:
+                if stop_loss is None:
+                    self.logger.error("Для расчета размера позиции необходимо указать стоп-лосс")
+                    return None
+                    
+                size = self.risk_manager.calculate_position_size(
                     symbol=symbol,
-                    side=opposite_side,
-                    qty=position_size,
-                    price=stop_loss,
-                    order_type="stop",
-                    time_in_force="GoodTillCancel",
-                    reduce_only=True,
-                    close_on_trigger=True,
-                    trigger_price=stop_loss,
-                    **kwargs
+                    entry_price=entry_price,
+                    stop_loss_price=stop_loss
                 )
-                result["stop_loss"] = sl_result
             
-            # Устанавливаем новый тейк-профит
-            if take_profit is not None:
-                tp_result = self.order_manager.place_order(
-                    symbol=symbol,
-                    side=opposite_side,
-                    qty=position_size,
-                    price=take_profit,
-                    order_type="take_profit",
-                    time_in_force="GoodTillCancel",
-                    reduce_only=True,
-                    close_on_trigger=True,
-                    trigger_price=take_profit,
-                    **kwargs
-                )
-                result["take_profit"] = tp_result
+            # Журналирование операции
+            self.logger.info(f"Открытие позиции: {symbol} {side} размер={size} цена={entry_price}")
             
-            # Устанавливаем trailing stop
-            if trailing_stop is not None:
-                ts_result = self.client.set_trading_stop(
+            # Режим бумажной торговли
+            if self.paper_trading:
+                return self._open_paper_position(
                     symbol=symbol,
                     side=side,
+                    size=size,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    strategy_name=strategy_name
+                )
+            
+            # Размещение реального ордера
+            order_result = self._place_order(
+                symbol=symbol,
+                side=api_side,
+                order_type=order_type,
+                qty=size,
+                price=entry_price if order_type == 'Limit' else None
+            )
+            
+            if order_result and order_result['retCode'] == 0:
+                order_id = order_result['result']['orderId']
+                self.logger.info(f"Ордер размещен успешно: {order_id}")
+                
+                # Установка стоп-лосса и тейк-профита
+                if stop_loss or take_profit:
+                    self._set_stop_loss_take_profit(
+                        symbol=symbol,
+                        side=side,
+                        size=size,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit
+                    )
+                
+                # Принудительное обновление кэша позиций
+                self._update_positions(force=True)
+                
+                # Добавление риска в риск-менеджер
+                if stop_loss:
+                    self.risk_manager.add_position_risk(
+                        symbol=symbol,
+                        size=size,
+                        entry_price=entry_price,
+                        stop_loss=stop_loss
+                    )
+                
+                # Журналирование операции
+                self.operations_log.append({
+                    'time': datetime.now(),
+                    'operation': 'open_position',
+                    'symbol': symbol,
+                    'side': side,
+                    'size': size,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'strategy': strategy_name,
+                    'order_id': order_id
+                })
+                
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'symbol': symbol,
+                    'side': side,
+                    'size': size,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit
+                }
+            else:
+                error_msg = order_result['retMsg'] if order_result else "Неизвестная ошибка"
+                self.logger.error(f"Ошибка при размещении ордера: {error_msg}")
+                return None
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при открытии позиции: {str(e)}")
+            return None
+    
+    def close_position(self, symbol, side=None, percentage=100.0):
+        """
+        Закрытие позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str, optional): сторона ('long' или 'short')
+            percentage (float): процент позиции для закрытия
+            
+        Returns:
+            dict: результат закрытия позиции
+        """
+        try:
+            # Принудительное обновление кэша позиций
+            self._update_positions(force=True)
+            
+            # Поиск позиции для закрытия
+            position = None
+            
+            if side:
+                position_key = f"{symbol}_{side.lower()}"
+                position = self.positions.get(position_key)
+            else:
+                # Поиск любой позиции по символу
+                for key, pos in self.positions.items():
+                    if pos['symbol'] == symbol:
+                        position = pos
+                        break
+            
+            if not position:
+                self.logger.warning(f"Не найдена позиция для закрытия: {symbol} {side}")
+                return None
+            
+            # Расчет размера для закрытия
+            size = position['size'] * percentage / 100.0
+            
+            # Противоположная сторона для закрытия
+            close_side = "Buy" if position['side'] == "short" else "Sell"
+            
+            self.logger.info(f"Закрытие позиции: {symbol} {position['side']} размер={size}")
+            
+            # Режим бумажной торговли
+            if self.paper_trading:
+                return self._close_paper_position(
+                    symbol=symbol,
+                    side=position['side'],
+                    size=size,
+                    percentage=percentage
+                )
+            
+            # Размещение ордера на закрытие
+            order_result = self._place_order(
+                symbol=symbol,
+                side=close_side,
+                order_type='Market',
+                qty=size,
+                price=None,
+                reduce_only=True
+            )
+            
+            if order_result and order_result['retCode'] == 0:
+                order_id = order_result['result']['orderId']
+                self.logger.info(f"Ордер на закрытие размещен успешно: {order_id}")
+                
+                # Принудительное обновление кэша позиций
+                self._update_positions(force=True)
+                
+                # Уменьшение риска в риск-менеджере
+                if position.get('entry_price') and position.get('stop_loss'):
+                    self.risk_manager.remove_position_risk(
+                        symbol=symbol,
+                        size=size,
+                        entry_price=position['entry_price'],
+                        stop_loss=position['stop_loss']
+                    )
+                
+                # Журналирование операции
+                self.operations_log.append({
+                    'time': datetime.now(),
+                    'operation': 'close_position',
+                    'symbol': symbol,
+                    'side': position['side'],
+                    'size': size,
+                    'percentage': percentage,
+                    'order_id': order_id
+                })
+                
+                return {
+                    'success': True,
+                    'order_id': order_id,
+                    'symbol': symbol,
+                    'side': position['side'],
+                    'size': size,
+                    'percentage': percentage
+                }
+            else:
+                error_msg = order_result['retMsg'] if order_result else "Неизвестная ошибка"
+                self.logger.error(f"Ошибка при размещении ордера на закрытие: {error_msg}")
+                return None
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при закрытии позиции: {str(e)}")
+            return None
+    
+    def modify_position(self, symbol, side, stop_loss=None, take_profit=None, trailing_stop=None):
+        """
+        Изменение параметров позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            stop_loss (float, optional): новый уровень стоп-лосса
+            take_profit (float, optional): новый уровень тейк-профита
+            trailing_stop (float, optional): новый уровень трейлинг-стопа
+            
+        Returns:
+            dict: результат изменения позиции
+        """
+        try:
+            # Принудительное обновление кэша позиций
+            self._update_positions(force=True)
+            
+            # Поиск позиции для изменения
+            position_key = f"{symbol}_{side.lower()}"
+            position = self.positions.get(position_key)
+            
+            if not position:
+                self.logger.warning(f"Не найдена позиция для модификации: {symbol} {side}")
+                return None
+            
+            # Журналирование операции
+            self.logger.info(f"Изменение позиции: {symbol} {side} SL={stop_loss} TP={take_profit} TS={trailing_stop}")
+            
+            # Режим бумажной торговли
+            if self.paper_trading:
+                return self._modify_paper_position(
+                    symbol=symbol,
+                    side=side,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
                     trailing_stop=trailing_stop
                 )
-                result["trailing_stop"] = ts_result
-                
+            
+            # Отмена существующих заявок на SL/TP
+            self._cancel_stop_orders(symbol)
+            
+            # Установка новых значений SL/TP
+            result = self._set_stop_loss_take_profit(
+                symbol=symbol,
+                side=side,
+                size=position['size'],
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trailing_stop=trailing_stop
+            )
+            
+            # Журналирование операции
+            self.operations_log.append({
+                'time': datetime.now(),
+                'operation': 'modify_position',
+                'symbol': symbol,
+                'side': side,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'trailing_stop': trailing_stop
+            })
+            
+            return result
+        
         except Exception as e:
-            logger.error(f"Failed to modify position parameters: {str(e)}")
-            result["error"] = str(e)
-        
-        return result
+            self.logger.error(f"Ошибка при изменении позиции: {str(e)}")
+            return None
     
-    def get_position_pnl(self, symbol: str, side: str = None) -> Dict:
+    def manage_positions(self):
         """
-        Получает информацию о прибыли/убытке позиции
+        Управление открытыми позициями (проверка трейлинг-стопов и т.д.)
+        """
+        try:
+            # Принудительное обновление кэша позиций
+            self._update_positions(force=True)
+            
+            for position_key, position in self.positions.items():
+                symbol = position['symbol']
+                side = position['side']
+                
+                # Проверка условий для трейлинг-стопа
+                if self.config['risk_management']['trailing_stop_enabled']:
+                    self._check_trailing_stop(symbol, side, position)
+                
+                # Другая логика управления позициями может быть добавлена здесь
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при управлении позициями: {str(e)}")
+    
+    def _check_trailing_stop(self, symbol, side, position):
+        """
+        Проверка и обновление трейлинг-стопа
         
         Args:
-            symbol: Символ торговой пары
-            side: Сторона позиции ('buy' или 'sell'). Если не указана, 
-                  возвращает суммарную P&L по всем позициям
-                  
-        Returns:
-            Dict: Информация о P&L
+            symbol (str): торговая пара
+            side (str): сторона позиции
+            position (dict): данные позиции
         """
+        try:
+            # Получение текущей цены
+            ticker = self._get_ticker(symbol)
+            if not ticker:
+                return
+            
+            current_price = float(ticker['last_price'])
+            entry_price = position['entry_price']
+            
+            # Настройки трейлинг-стопа
+            activation_percent = self.config['risk_management']['trailing_stop_activation'] / 100.0
+            callback_percent = self.config['risk_management']['trailing_stop_callback'] / 100.0
+            
+            # Проверка для лонг-позиции
+            if side == 'long':
+                profit_percent = (current_price - entry_price) / entry_price
+                
+                # Если достигнут порог активации трейлинг-стопа
+                if profit_percent >= activation_percent:
+                    # Расчет нового уровня трейлинг-стопа
+                    new_stop = current_price * (1 - callback_percent)
+                    
+                    # Проверка, что новый стоп выше предыдущего
+                    current_stop = position.get('stop_loss', 0)
+                    if new_stop > current_stop:
+                        # Обновление стоп-лосса
+                        self.modify_position(symbol, side, stop_loss=new_stop)
+                        self.logger.info(f"Трейлинг-стоп активирован: {symbol} новый уровень={new_stop}")
+            
+            # Проверка для шорт-позиции
+            elif side == 'short':
+                profit_percent = (entry_price - current_price) / entry_price
+                
+                # Если достигнут порог активации трейлинг-стопа
+                if profit_percent >= activation_percent:
+                    # Расчет нового уровня трейлинг-стопа
+                    new_stop = current_price * (1 + callback_percent)
+                    
+                    # Проверка, что новый стоп ниже предыдущего
+                    current_stop = position.get('stop_loss', float('inf'))
+                    if new_stop < current_stop:
+                        # Обновление стоп-лосса
+                        self.modify_position(symbol, side, stop_loss=new_stop)
+                        self.logger.info(f"Трейлинг-стоп активирован: {symbol} новый уровень={new_stop}")
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при проверке трейлинг-стопа: {str(e)}")
+    
+    def _place_order(self, symbol, side, order_type, qty, price=None, reduce_only=False):
+        """
+        Размещение ордера через API
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('Buy' или 'Sell')
+            order_type (str): тип ордера ('Market' или 'Limit')
+            qty (float): количество
+            price (float, optional): цена для лимитного ордера
+            reduce_only (bool): флаг reduce_only
+            
+        Returns:
+            dict: ответ API или None в случае ошибки
+        """
+        try:
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": order_type,
+                "qty": str(qty),
+                "timeInForce": "GTC",
+                "reduceOnly": reduce_only
+            }
+            
+            if order_type == "Limit" and price is not None:
+                params["price"] = str(price)
+            
+            return self.api_client.place_order(**params)
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при размещении ордера: {str(e)}")
+            return None
+    
+    def _set_stop_loss_take_profit(self, symbol, side, size, stop_loss=None, take_profit=None, trailing_stop=None):
+        """
+        Установка стоп-лосса и тейк-профита
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            size (float): размер позиции
+            stop_loss (float, optional): уровень стоп-лосса
+            take_profit (float, optional): уровень тейк-профита
+            trailing_stop (float, optional): уровень трейлинг-стопа
+            
+        Returns:
+            dict: результат установки стоп-лосса и тейк-профита
+        """
+        try:
+            result = {'success': True}
+            
+            # Нормализация стороны
+            api_side = "Sell" if side.lower() == "long" else "Buy"
+            
+            # Установка стоп-лосса
+            if stop_loss is not None:
+                sl_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": api_side,
+                    "orderType": "Market",
+                    "qty": str(size),
+                    "triggerPrice": str(stop_loss),
+                    "triggerBy": "LastPrice",
+                    "stopOrderType": "StopLoss",
+                    "timeInForce": "GoodTillCancel",
+                    "reduceOnly": True
+                }
+                
+                sl_response = self.api_client.place_order(**sl_params)
+                
+                if sl_response['retCode'] == 0:
+                    result['stop_loss'] = {
+                        'success': True,
+                        'order_id': sl_response['result']['orderId']
+                    }
+                else:
+                    result['stop_loss'] = {
+                        'success': False,
+                        'error': sl_response['retMsg']
+                    }
+            
+            # Установка тейк-профита
+            if take_profit is not None:
+                tp_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": api_side,
+                    "orderType": "Market",
+                    "qty": str(size),
+                    "triggerPrice": str(take_profit),
+                    "triggerBy": "LastPrice",
+                    "stopOrderType": "TakeProfit",
+                    "timeInForce": "GoodTillCancel",
+                    "reduceOnly": True
+                }
+                
+                tp_response = self.api_client.place_order(**tp_params)
+                
+                if tp_response['retCode'] == 0:
+                    result['take_profit'] = {
+                        'success': True,
+                        'order_id': tp_response['result']['orderId']
+                    }
+                else:
+                    result['take_profit'] = {
+                        'success': False,
+                        'error': tp_response['retMsg']
+                    }
+            
+            # Установка трейлинг-стопа
+            if trailing_stop is not None:
+                ts_params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": api_side,
+                    "orderType": "Market",
+                    "qty": str(size),
+                    "triggerPrice": "0",  # Будет использоваться цена активации
+                    "triggerBy": "LastPrice",
+                    "stopOrderType": "TrailingStop",
+                    "timeInForce": "GoodTillCancel",
+                    "trailingStop": str(trailing_stop),
+                    "reduceOnly": True
+                }
+                
+                ts_response = self.api_client.place_order(**ts_params)
+                
+                if ts_response['retCode'] == 0:
+                    result['trailing_stop'] = {
+                        'success': True,
+                        'order_id': ts_response['result']['orderId']
+                    }
+                else:
+                    result['trailing_stop'] = {
+                        'success': False,
+                        'error': ts_response['retMsg']
+                    }
+            
+            return result
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при установке SL/TP: {str(e)}")
+            return {'success': False, 'error': str(e)}
+    
+    def _cancel_stop_orders(self, symbol):
+        """
+        Отмена всех стоп-ордеров по символу
+        
+        Args:
+            symbol (str): торговая пара
+            
+        Returns:
+            bool: True в случае успеха, иначе False
+        """
+        try:
+            # Получение активных стоп-ордеров
+            response = self.api_client.get_open_orders(
+                category="linear",
+                symbol=symbol,
+                orderFilter="StopOrder"
+            )
+            
+            if response['retCode'] != 0:
+                self.logger.error(f"Ошибка при получении ордеров: {response['retMsg']}")
+                return False
+            
+            # Отмена каждого ордера
+            success = True
+            for order in response['result']['list']:
+                cancel_response = self.api_client.cancel_order(
+                    category="linear",
+                    symbol=symbol,
+                    orderId=order['orderId']
+                )
+                
+                if cancel_response['retCode'] != 0:
+                    self.logger.error(f"Ошибка при отмене ордера {order['orderId']}: {cancel_response['retMsg']}")
+                    success = False
+            
+            return success
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при отмене стоп-ордеров: {str(e)}")
+            return False
+    
+    def _set_leverage(self, symbol, leverage):
+        """
+        Установка кредитного плеча
+        
+        Args:
+            symbol (str): торговая пара
+            leverage (int): значение плеча
+            
+        Returns:
+            bool: True в случае успеха, иначе False
+        """
+        try:
+            if self.paper_trading:
+                return True
+                
+            response = self.api_client.set_leverage(
+                category="linear",
+                symbol=symbol,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage)
+            )
+            
+            if response['retCode'] == 0:
+                self.logger.info(f"Плечо для {symbol} установлено: {leverage}x")
+                return True
+            else:
+                self.logger.warning(f"Ошибка при установке плеча для {symbol}: {response['retMsg']}")
+                return False
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при установке плеча: {str(e)}")
+            return False
+    
+    def _get_ticker(self, symbol):
+        """
+        Получение данных тикера
+        
+        Args:
+            symbol (str): торговая пара
+            
+        Returns:
+            dict: данные тикера или None в случае ошибки
+        """
+        try:
+            response = self.api_client.get_tickers(
+                category="linear",
+                symbol=symbol
+            )
+            
+            if response['retCode'] == 0 and response['result']['list']:
+                return response['result']['list'][0]
+            else:
+                self.logger.warning(f"Ошибка при получении тикера для {symbol}")
+                return None
+        
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении тикера: {str(e)}")
+            return None
+    
+    # Методы для бумажной торговли
+    def _open_paper_position(self, symbol, side, size, entry_price, stop_loss=None, take_profit=None, strategy_name=None):
+        """
+        Открытие бумажной позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            size (float): размер позиции
+            entry_price (float): цена входа
+            stop_loss (float, optional): уровень стоп-лосса
+            take_profit (float, optional): уровень тейк-профита
+            strategy_name (str, optional): название стратегии
+            
+        Returns:
+            dict: результат открытия позиции
+        """
+        position_key = f"{symbol}_{side.lower()}"
+        
+        # Создание новой позиции
+        position = {
+            'symbol': symbol,
+            'side': side.lower(),
+            'size': size,
+            'entry_price': entry_price,
+            'leverage': self.config['risk_management']['leverage'],
+            'margin_type': 'isolated',
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'unrealized_pnl': 0.0,
+            'realized_pnl': 0.0,
+            'position_value': size * entry_price,
+            'strategy': strategy_name,
+            'created_time': datetime.now(),
+            'updated_time': datetime.now()
+        }
+        
+        # Добавление позиции в кэш
+        self.paper_positions[position_key] = position
+        
+        # Генерация уникального ID ордера
+        order_id = f"paper_{int(time.time())}_{hash(symbol)}"
+        
+        # Журналирование операции
+        self.operations_log.append({
+            'time': datetime.now(),
+            'operation': 'open_paper_position',
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'strategy': strategy_name,
+            'order_id': order_id
+        })
+        
+        # Возвращаем результат
+        return {
+            'success': True,
+            'order_id': order_id,
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit
+        }
+    
+    def _close_paper_position(self, symbol, side, size, percentage):
+        """
+        Закрытие бумажной позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            size (float): размер позиции для закрытия
+            percentage (float): процент позиции для закрытия
+            
+        Returns:
+            dict: результат закрытия позиции
+        """
+        position_key = f"{symbol}_{side.lower()}"
+        
+        # Проверка существования позиции
+        if position_key not in self.paper_positions:
+            self.logger.warning(f"Бумажная позиция не найдена: {symbol} {side}")
+            return None
+        
+        position = self.paper_positions[position_key]
+        
+        # Получение текущей цены
+        ticker = self._get_ticker(symbol)
+        close_price = float(ticker['last_price']) if ticker else position['entry_price']
+        
+        # Расчет прибыли/убытка
+        if side.lower() == "long":
+            pnl = (close_price - position['entry_price']) * size
+        else:
+            pnl = (position['entry_price'] - close_price) * size
+        
+        # Применение плеча
+        pnl *= position['leverage']
+        
+        # Обновление баланса
+        self.paper_balance += pnl
+        
+        # Обновление позиции
+        position['size'] -= size
+        position['realized_pnl'] += pnl
+        position['updated_time'] = datetime.now()
+        
+        # Генерация ID ордера
+        order_id = f"paper_close_{int(time.time())}_{hash(symbol)}"
+        
+        # Если позиция полностью закрыта, удаляем ее
+        if position['size'] <= 0 or percentage >= 100.0:
+            del self.paper_positions[position_key]
+        
+        # Журналирование операции
+        self.operations_log.append({
+            'time': datetime.now(),
+            'operation': 'close_paper_position',
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'percentage': percentage,
+            'close_price': close_price,
+            'pnl': pnl,
+            'order_id': order_id
+        })
+        
+        # Уведомление в лог
+        self.logger.info(f"Бумажная позиция закрыта: {symbol} {side} размер={size} P&L={pnl:.2f}")
+        
+        # Возвращаем результат
+        return {
+            'success': True,
+            'order_id': order_id,
+            'symbol': symbol,
+            'side': side,
+            'size': size,
+            'close_price': close_price,
+            'pnl': pnl
+        }
+    
+    def _modify_paper_position(self, symbol, side, stop_loss=None, take_profit=None, trailing_stop=None):
+        """
+        Изменение параметров бумажной позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str): сторона ('long' или 'short')
+            stop_loss (float, optional): новый уровень стоп-лосса
+            take_profit (float, optional): новый уровень тейк-профита
+            trailing_stop (float, optional): новый уровень трейлинг-стопа
+            
+        Returns:
+            dict: результат изменения позиции
+        """
+        position_key = f"{symbol}_{side.lower()}"
+        
+        # Проверка существования позиции
+        if position_key not in self.paper_positions:
+            self.logger.warning(f"Бумажная позиция не найдена: {symbol} {side}")
+            return None
+        
+        position = self.paper_positions[position_key]
+        
+        # Обновление параметров
+        if stop_loss is not None:
+            position['stop_loss'] = stop_loss
+        
+        if take_profit is not None:
+            position['take_profit'] = take_profit
+        
+        if trailing_stop is not None:
+            position['trailing_stop'] = trailing_stop
+        
+        position['updated_time'] = datetime.now()
+        
+        # Журналирование операции
+        self.operations_log.append({
+            'time': datetime.now(),
+            'operation': 'modify_paper_position',
+            'symbol': symbol,
+            'side': side,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'trailing_stop': trailing_stop
+        })
+        
+        # Уведомление в лог
+        self.logger.info(f"Бумажная позиция изменена: {symbol} {side} SL={stop_loss} TP={take_profit} TS={trailing_stop}")
+        
+        # Возвращаем результат
+        return {
+            'success': True,
+            'symbol': symbol,
+            'side': side,
+            'stop_loss': stop_loss if stop_loss is not None else position.get('stop_loss'),
+            'take_profit': take_profit if take_profit is not None else position.get('take_profit'),
+            'trailing_stop': trailing_stop if trailing_stop is not None else position.get('trailing_stop')
+        }
+    
+    def _check_paper_stop_loss_take_profit(self):
+        """
+        Проверка стоп-лоссов и тейк-профитов для бумажных позиций
+        """
+        if not self.paper_trading:
+            return
+        
+        for position_key, position in list(self.paper_positions.items()):
+            symbol = position['symbol']
+            side = position['side']
+            
+            # Получение текущей цены
+            ticker = self._get_ticker(symbol)
+            if not ticker:
+                continue
+                
+            current_price = float(ticker['last_price'])
+            
+            # Проверка стоп-лосса
+            if position.get('stop_loss'):
+                stop_loss = position['stop_loss']
+                
+                # Для лонг-позиций
+                if side == 'long' and current_price <= stop_loss:
+                    self.logger.info(f"Сработал стоп-лосс для {symbol} {side}: {stop_loss}")
+                    self._close_paper_position(symbol, side, position['size'], 100.0)
+                    continue
+                
+                # Для шорт-позиций
+                elif side == 'short' and current_price >= stop_loss:
+                    self.logger.info(f"Сработал стоп-лосс для {symbol} {side}: {stop_loss}")
+                    self._close_paper_position(symbol, side, position['size'], 100.0)
+                    continue
+            
+            # Проверка тейк-профита
+            if position.get('take_profit'):
+                take_profit = position['take_profit']
+                
+                # Для лонг-позиций
+                if side == 'long' and current_price >= take_profit:
+                    self.logger.info(f"Сработал тейк-профит для {symbol} {side}: {take_profit}")
+                    self._close_paper_position(symbol, side, position['size'], 100.0)
+                    continue
+                
+                # Для шорт-позиций
+                elif side == 'short' and current_price <= take_profit:
+                    self.logger.info(f"Сработал тейк-профит для {symbol} {side}: {take_profit}")
+                    self._close_paper_position(symbol, side, position['size'], 100.0)
+                    continue
+    
+    def _update_paper_positions_pnl(self):
+        """
+        Обновление P&L для бумажных позиций
+        """
+        if not self.paper_trading:
+            return
+        
+        for position_key, position in self.paper_positions.items():
+            symbol = position['symbol']
+            side = position['side']
+            size = position['size']
+            entry_price = position['entry_price']
+            
+            # Получение текущей цены
+            ticker = self._get_ticker(symbol)
+            if not ticker:
+                continue
+                
+            current_price = float(ticker['last_price'])
+            
+            # Расчет нереализованной прибыли/убытка
+            if side == 'long':
+                pnl = (current_price - entry_price) * size
+            else:
+                pnl = (entry_price - current_price) * size
+            
+            # Применение плеча
+            pnl *= position['leverage']
+            
+            # Обновление позиции
+            position['unrealized_pnl'] = pnl
+            position['updated_time'] = datetime.now()
+    
+    def get_position_pnl(self, symbol, side=None):
+        """
+        Получение P&L по позиции
+        
+        Args:
+            symbol (str): торговая пара
+            side (str, optional): сторона ('long' или 'short')
+            
+        Returns:
+            dict: информация о P&L
+        """
+        # Принудительное обновление кэша позиций
+        self._update_positions(force=True)
+        
+        # В режиме бумажной торговли обновляем P&L
+        if self.paper_trading:
+            self._update_paper_positions_pnl()
+        
+        # Если указана сторона, ищем конкретную позицию
         if side:
-            position = self.get_position(symbol, side)
-            if not position:
-                return {"unrealized_pnl": 0, "realized_pnl": 0, "total_pnl": 0}
+            position_key = f"{symbol}_{side.lower()}"
+            position = self.positions.get(position_key)
             
-            return {
-                "unrealized_pnl": float(position.get("unrealised_pnl", 0)),
-                "realized_pnl": float(position.get("realised_pnl", 0)),
-                "total_pnl": float(position.get("unrealised_pnl", 0)) + float(position.get("realised_pnl", 0)),
-                "roe": float(position.get("return_on_equity", 0)) * 100  # ROE в процентах
-            }
-        else:
-            # Получаем все позиции по символу
-            positions = self.get_position(symbol)
-            
-            # Суммируем P&L по всем позициям
-            unrealized_pnl = sum(float(p.get("unrealised_pnl", 0)) for p in positions)
-            realized_pnl = sum(float(p.get("realised_pnl", 0)) for p in positions)
-            
-            return {
-                "unrealized_pnl": unrealized_pnl,
-                "realized_pnl": realized_pnl, 
-                "total_pnl": unrealized_pnl + realized_pnl
-            }
-    
-    def calculate_optimal_position_params(
-        self,
-        symbol: str,
-        side: str,
-        entry_price: Union[float, Decimal] = None,
-        risk_percentage: float = 1.0,
-        risk_reward_ratio: float = 2.0,
-        atr_multiplier: float = 1.5,
-        **kwargs
-    ) -> Dict:
-        """
-        Рассчитывает оптимальные параметры для новой позиции на основе ATR и риска
+            if position:
+                return {
+                    'symbol': symbol,
+                    'side': side,
+                    'unrealized_pnl': position.get('unrealized_pnl', 0),
+                    'realized_pnl': position.get('realized_pnl', 0),
+                    'total_pnl': position.get('unrealized_pnl', 0) + position.get('realized_pnl', 0)
+                }
+            else:
+                return {
+                    'symbol': symbol,
+                    'side': side,
+                    'unrealized_pnl': 0,
+                    'realized_pnl': 0,
+                    'total_pnl': 0
+                }
         
-        Args:
-            symbol: Символ торговой пары
-            side: Сторона ('buy' или 'sell')
-            entry_price: Цена входа (если None, используется текущая цена)
-            risk_percentage: Процент риска от баланса
-            risk_reward_ratio: Соотношение риск/прибыль
-            atr_multiplier: Множитель ATR для стоп-лосса
-            
-        Returns:
-            Dict: Оптимальные параметры позиции
-        """
-        # Получаем текущую цену, если необходимо
-        if entry_price is None:
-            ticker = self.client.get_ticker(symbol)
-            entry_price = float(ticker["last_price"])
-        else:
-            entry_price = float(entry_price)
+        # Если сторона не указана, суммируем P&L по всем позициям для символа
+        unrealized_pnl = 0
+        realized_pnl = 0
         
-        # Получаем значение ATR
-        # Предполагаем, что у нас есть функция для расчета ATR
-        from ..indicators.volatility import get_atr
-        atr = get_atr(self.client, symbol, timeframe="1h", length=14)
-        
-        # Рассчитываем стоп-лосс на основе ATR
-        if side.lower() == "buy":
-            stop_loss = entry_price - (atr * atr_multiplier)
-        else:
-            stop_loss = entry_price + (atr * atr_multiplier)
-        
-        # Рассчитываем тейк-профит на основе риск/прибыль
-        risk = abs(entry_price - stop_loss)
-        reward = risk * risk_reward_ratio
-        
-        if side.lower() == "buy":
-            take_profit = entry_price + reward
-        else:
-            take_profit = entry_price - reward
-        
-        # Получаем баланс аккаунта
-        account_info = self.client.get_wallet_balance()
-        balance = float(account_info["balance"])
-        
-        # Получаем текущее плечо
-        leverage = self.client.get_leverage(symbol)
-        
-        # Рассчитываем размер позиции
-        size = calculate_position_size(
-            balance=balance,
-            risk_percentage=risk_percentage,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            leverage=leverage
-        )
+        for position_key, position in self.positions.items():
+            if position['symbol'] == symbol:
+                unrealized_pnl += position.get('unrealized_pnl', 0)
+                realized_pnl += position.get('realized_pnl', 0)
         
         return {
-            "symbol": symbol,
-            "side": side,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "size": size,
-            "leverage": leverage,
-            "risk_amount": balance * risk_percentage / 100.0,
-            "potential_profit": balance * risk_percentage / 100.0 * risk_reward_ratio,
-            "risk_pct": risk_percentage,
-            "risk_reward_ratio": risk_reward_ratio
+            'symbol': symbol,
+            'unrealized_pnl': unrealized_pnl,
+            'realized_pnl': realized_pnl,
+            'total_pnl': unrealized_pnl + realized_pnl
         }
-
-
-def calculate_position_size(
-    balance: float,
-    risk_percentage: float,
-    entry_price: float,
-    stop_loss: float,
-    leverage: float = 1.0
-) -> float:
-    """
-    Рассчитывает размер позиции на основе риска
     
-    Args:
-        balance: Баланс аккаунта
-        risk_percentage: Процент риска от баланса
-        entry_price: Цена входа
-        stop_loss: Уровень стоп-лосса
-        leverage: Кредитное плечо
+    def get_position(self, symbol, side=None):
+        """
+        Получение информации о позиции
         
-    Returns:
-        float: Размер позиции в контрактах
-    """
-    # Рассчитываем сумму риска в валюте
-    risk_amount = balance * (risk_percentage / 100.0)
+        Args:
+            symbol (str): торговая пара
+            side (str, optional): сторона ('long' или 'short')
+            
+        Returns:
+            dict or list: информация о позиции или список позиций
+        """
+        # Принудительное обновление кэша позиций
+        self._update_positions(force=True)
+        
+        if side:
+            position_key = f"{symbol}_{side.lower()}"
+            return self.positions.get(position_key)
+        else:
+            # Возвращаем все позиции по символу
+            return [p for p in self.positions.values() if p['symbol'] == symbol]
     
-    # Рассчитываем риск на единицу (разница между входом и стоп-лоссом)
-    price_risk = abs(entry_price - stop_loss)
-    
-    if price_risk == 0:
-        raise ValueError("Entry price cannot be the same as stop loss")
-    
-    # Рассчитываем размер позиции без учета плеча
-    raw_position_size = risk_amount / price_risk
-    
-    # Учитываем плечо
-    position_size = raw_position_size * leverage
-    
-    return position_size
+    def get_positions_summary(self):
+        """
+        Получение сводной информации по всем позициям
+        
+        Returns:
+            dict: сводная информация
+        """
+        # Принудительное обновление кэша позиций
+        self._update_positions(force=True)
+        
+        # В режиме бумажной торговли обновляем P&L
+        if self.paper_trading:
+            self._update_paper_positions_pnl()
+            self._check_paper_stop_loss_take_profit()
+        
+        # Статистика по всем позициям
+        total_positions = len(self.positions)
+        total_long_positions = sum(1 for p in self.positions.values() if p['side'] == 'long')
+        total_short_positions = sum(1 for p in self.positions.values() if p['side'] == 'short')
+        
+        # Общий P&L
+        total_unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self.positions.values())
+        total_realized_pnl = sum(p.get('realized_pnl', 0) for p in self.positions.values())
+        
+        # Позиции по символам
+        positions_by_symbol = {}
+        for position in self.positions.values():
+            symbol = position['symbol']
+            if symbol not in positions_by_symbol:
+                positions_by_symbol[symbol] = []
+            positions_by_symbol[symbol].append(position)
+        
+        return {
+            'total_positions': total_positions,
+            'long_positions': total_long_positions,
+            'short_positions': total_short_positions,
+            'unrealized_pnl': total_unrealized_pnl,
+            'realized_pnl': total_realized_pnl,
+            'total_pnl': total_unrealized_pnl + total_realized_pnl,
+            'positions_by_symbol': positions_by_symbol,
+            'paper_trading': self.paper_trading,
+            'paper_balance': self.paper_balance if self.paper_trading else None
+        }
